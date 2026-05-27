@@ -1,47 +1,91 @@
 /**
- * In-memory стан: poolId → історія SetPoolStartedTimestamp викликів + message_id у кожному чаті.
+ * In-memory стан: poolId → історія + token metadata + message_id у кожному чаті.
  *
  * При перезапуску app — стан губиться. Для Fly.io з auto_start цього достатньо (machine
  * тримається теплою). Якщо хочеш персистентність — переключи на ioredis,
  * пов'язавши через REDIS_URL (як у твоєму OKX-боті).
  */
 
-export type StartCall = {
+import type { TokenInfo } from './erc20.js';
+
+export type EventKind = 'init' | 'reschedule' | 'admin';
+
+export type EventCall = {
+  kind: EventKind;
   txHash: string;
-  sentAtMs: number;        // коли tx підтверджено on-chain
-  startTimestampSec: number;
+  sentAtMs: number;
+  startTimestampSec?: number; // тільки для init/reschedule
 };
 
 export type PoolState = {
   poolId: string;
-  history: StartCall[];                  // у порядку отримання (старі → нові)
-  messages: Record<string, number>;      // chat_id (як string) → telegram message_id
+  tokenInfo: TokenInfo | null;            // null, поки initializePool ще не приходив
+  currency0: string | null;               // token address
+  currency1: string | null;               // зазвичай USDT
+  fee: number | null;
+  history: EventCall[];                   // у порядку отримання
+  /** msg_id первинного "New Pool" повідомлення (для edit при rescheduling) */
+  initMessages: Record<string, number>;   // chatId → message_id
 };
 
 const store = new Map<string, PoolState>();
+
+function emptyState(poolId: string): PoolState {
+  return {
+    poolId: poolId.toLowerCase(),
+    tokenInfo: null,
+    currency0: null,
+    currency1: null,
+    fee: null,
+    history: [],
+    initMessages: {},
+  };
+}
 
 export function getPool(poolId: string): PoolState | undefined {
   return store.get(poolId.toLowerCase());
 }
 
-export function upsertPoolCall(poolId: string, call: StartCall): PoolState {
+export function ensurePool(poolId: string): PoolState {
   const key = poolId.toLowerCase();
   let st = store.get(key);
   if (!st) {
-    st = { poolId: key, history: [], messages: {} };
+    st = emptyState(key);
     store.set(key, st);
   }
-  // Дедуп — якщо такий самий txHash вже є, не додаємо
-  if (!st.history.some((c) => c.txHash === call.txHash)) {
+  return st;
+}
+
+export function recordEvent(poolId: string, call: EventCall): PoolState {
+  const st = ensurePool(poolId);
+  if (!st.history.some((c) => c.txHash === call.txHash && c.kind === call.kind)) {
     st.history.push(call);
   }
   return st;
 }
 
-export function rememberMessage(poolId: string, chatId: string, messageId: number): void {
+export function setPoolMetadata(
+  poolId: string,
+  meta: { currency0: string; currency1: string; fee: number; tokenInfo: TokenInfo | null },
+): PoolState {
+  const st = ensurePool(poolId);
+  st.currency0 = meta.currency0.toLowerCase();
+  st.currency1 = meta.currency1.toLowerCase();
+  st.fee = meta.fee;
+  if (meta.tokenInfo) st.tokenInfo = meta.tokenInfo;
+  return st;
+}
+
+export function rememberInitMessage(poolId: string, chatId: string, messageId: number): void {
   const st = store.get(poolId.toLowerCase());
   if (!st) return;
-  st.messages[chatId] = messageId;
+  st.initMessages[chatId] = messageId;
+}
+
+export function alreadyProcessed(poolId: string, kind: EventKind, txHash: string): boolean {
+  const st = store.get(poolId.toLowerCase());
+  if (!st) return false;
+  return st.history.some((c) => c.kind === kind && c.txHash === txHash);
 }
 
 export function size(): number {

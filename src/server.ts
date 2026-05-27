@@ -5,17 +5,32 @@ import * as pinoHttpNS from 'pino-http';
 
 import { verifyTenderlySignature } from './tenderly/verify.js';
 import { decodeSetPoolStart } from './decoder.js';
+import {
+  decodeInitializePool,
+  INITIALIZE_POOL_SELECTOR,
+} from './decoders/initializePool.js';
+import {
+  decodeAddPoolOwners,
+  ADD_POOL_OWNERS_SELECTOR,
+} from './decoders/addPoolOwners.js';
+import { fetchTokenInfo, type TokenInfo } from './erc20.js';
 import { sendMessage, editMessage, escHtml, getChatIds } from './telegram.js';
-import { getPool, upsertPoolCall, rememberMessage } from './state.js';
+import {
+  getPool,
+  recordEvent,
+  setPoolMetadata,
+  rememberInitMessage,
+  alreadyProcessed,
+} from './state.js';
 import { formatKyiv, formatLead } from './utils/time.js';
 
 const app = express();
 
 // ====== BOOT LOG ======
-console.log('[boot] binance-alpha-tracker version=2026-05-21');
+console.log('[boot] binance-alpha-tracker version=2026-05-27');
 console.log('[boot] NODE_ENV=%s PORT=%s', process.env.NODE_ENV, process.env.PORT);
-console.log('[boot] POOL_CONTRACT=%s', process.env.POOL_CONTRACT || '(not set)');
-console.log('[boot] FUNCTION_SELECTOR=%s', process.env.FUNCTION_SELECTOR || '0x70e2af29 (default)');
+console.log('[boot] POOL_CONTRACTS=%s', process.env.POOL_CONTRACTS || process.env.POOL_CONTRACT || '(any)');
+console.log('[boot] BSC_RPC_URL=%s', process.env.BSC_RPC_URL || '(default public)');
 console.log('[boot] TELEGRAM_BOT_TOKEN=%s', process.env.TELEGRAM_BOT_TOKEN ? '(set)' : '(not set)');
 console.log('[boot] TELEGRAM_CHAT_IDS=%s', process.env.TELEGRAM_CHAT_IDS || '(not set)');
 console.log('[boot] TENDERLY_SIGNING_KEY=%s', process.env.TENDERLY_SIGNING_KEY ? '(set)' : '(not set)');
@@ -27,18 +42,76 @@ app.use(pinoHttp());
 app.get('/health', (_req: Request, res: Response) => res.status(200).send('ok'));
 app.get('/webhooks/tenderly', (_req, res) => res.status(200).send('ok - use POST here'));
 
-const EXPECTED_SELECTOR = (process.env.FUNCTION_SELECTOR || '0x70e2af29').toLowerCase();
-const POOL_CONTRACT = (process.env.POOL_CONTRACT || '').toLowerCase();
+const RESCHEDULE_SELECTOR = (process.env.FUNCTION_SELECTOR || '0x70e2af29').toLowerCase();
+const ALLOWED_CONTRACTS = (process.env.POOL_CONTRACTS || process.env.POOL_CONTRACT || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
-// ====== MESSAGE BUILDER ======
-function buildMessage(args: {
+// USDT BSC — використовується для розпізнавання quote-токена в pair-рядку
+const USDT_BSC = '0x55d398326f99059ff775485246999027b3197955';
+
+// ====== MESSAGE BUILDERS ======
+function tickerOrShort(t: TokenInfo | null, addr: string): string {
+  if (t?.symbol && t.symbol.length <= 12) return t.symbol;
+  return addr.slice(0, 6) + '…' + addr.slice(-4);
+}
+
+function quoteName(currency1: string): string {
+  return currency1.toLowerCase() === USDT_BSC ? 'USDT' : tickerOrShort(null, currency1);
+}
+
+function buildInitMessage(args: {
+  poolId: string;
+  txHash: string;
+  startTsSec: number;
+  currency0: string;
+  currency1: string;
+  fee: number;
+  tokenInfo: TokenInfo | null;
+}): string {
+  const { poolId, txHash, startTsSec, currency0, currency1, fee, tokenInfo } = args;
+
+  const sym = tickerOrShort(tokenInfo, currency0);
+  const quote = quoteName(currency1);
+  const name = tokenInfo?.name && tokenInfo.name !== sym ? ` (${tokenInfo.name})` : '';
+
+  const kyiv = formatKyiv(startTsSec);
+  const lead = formatLead(startTsSec);
+
+  const shortPool = `${poolId.slice(0, 10)}…${poolId.slice(-6)}`;
+  const scanUrl = `https://bscscan.com/tx/${txHash}`;
+  const tokenUrl = `https://bscscan.com/token/${currency0}`;
+  const feeBps = (fee / 100).toFixed(2); // 100 → 1.00 %
+
+  const refbackUrl = process.env.REFBACK_URL;
+  const refbackLabel = process.env.REFBACK_LABEL || 'Refback';
+  const refbackLine = refbackUrl
+    ? `\n\n<a href="${escHtml(refbackUrl)}">${escHtml(refbackLabel)}</a>`
+    : '';
+
+  return (
+    `🚀 <b>NEW BINANCE ALPHA POOL</b>\n\n` +
+    `<b>Pair:</b> <a href="${escHtml(tokenUrl)}"><b>${escHtml(sym)}</b></a>${escHtml(name)} / ${escHtml(quote)}\n` +
+    `<b>Start:</b> ${escHtml(kyiv)} Kyiv (${escHtml(lead)})\n` +
+    `<b>Fee:</b> ${escHtml(feeBps)}%\n` +
+    `<b>Pool:</b> <code>${escHtml(shortPool)}</code>\n` +
+    `<b>Token:</b> <code>${escHtml(currency0)}</code>\n\n` +
+    `<a href="${escHtml(scanUrl)}">View on BscScan</a>` +
+    refbackLine
+  );
+}
+
+function buildRescheduleMessage(args: {
   poolId: string;
   txHash: string;
   startTsSec: number;
   prevStartTsSec: number | null;
   updates: number;
+  tokenInfo: TokenInfo | null;
+  currency0: string | null;
 }): string {
-  const { poolId, txHash, startTsSec, prevStartTsSec, updates } = args;
+  const { poolId, txHash, startTsSec, prevStartTsSec, updates, tokenInfo, currency0 } = args;
 
   const kyiv = formatKyiv(startTsSec);
   const lead = formatLead(startTsSec);
@@ -46,7 +119,7 @@ function buildMessage(args: {
   const isUpdate = prevStartTsSec !== null && prevStartTsSec !== startTsSec;
   const title = isUpdate
     ? `⚡ <b>BINANCE ALPHA POOL RESCHEDULED</b>`
-    : `⚡ <b>NEW BINANCE ALPHA POOL SCHEDULED</b>`;
+    : `⚡ <b>BINANCE ALPHA POOL TIME SET</b>`;
 
   const startLine = isUpdate
     ? `<b>Start:</b> <s>${escHtml(formatKyiv(prevStartTsSec!))}</s> → <b>${escHtml(kyiv)} Kyiv</b> (${escHtml(lead)})`
@@ -55,19 +128,51 @@ function buildMessage(args: {
   const shortPool = `${poolId.slice(0, 10)}…${poolId.slice(-6)}`;
   const scanUrl = `https://bscscan.com/tx/${txHash}`;
 
+  const pairLine =
+    currency0 && tokenInfo
+      ? `<b>Token:</b> <a href="https://bscscan.com/token/${currency0}"><b>${escHtml(tickerOrShort(tokenInfo, currency0))}</b></a>\n`
+      : '';
+
   const refbackUrl = process.env.REFBACK_URL;
   const refbackLabel = process.env.REFBACK_LABEL || 'Refback';
-  const refbackLine =
-    refbackUrl ? `\n\n<a href="${escHtml(refbackUrl)}">${escHtml(refbackLabel)}</a>` : '';
+  const refbackLine = refbackUrl
+    ? `\n\n<a href="${escHtml(refbackUrl)}">${escHtml(refbackLabel)}</a>`
+    : '';
 
   return (
     `${title}\n\n` +
+    pairLine +
     `${startLine}\n` +
     `<b>Pool:</b> <code>${escHtml(shortPool)}</code>\n` +
     `<b>Updates:</b> ${updates}\n` +
     `<a href="${escHtml(scanUrl)}">View on Scan</a>` +
     refbackLine
   );
+}
+
+// ====== LOG HELPERS ======
+type RawLog = { address?: string; topics?: string[]; data?: string };
+
+/**
+ * З `tx.logs[]` витягуємо poolId — це topic[1] першого Initialize event
+ * на контракті пулу. Топік event-у Initialize містить poolId як перший
+ * indexed параметр (bytes32).
+ *
+ * Fallback: перший лог з ≥2 топіками на тому ж контракті, що й tx.to.
+ */
+function extractPoolIdFromLogs(logs: RawLog[] | undefined, txTo: string): string | null {
+  if (!Array.isArray(logs) || logs.length === 0) return null;
+  const target = (txTo || '').toLowerCase();
+  for (const log of logs) {
+    if (!log || !Array.isArray(log.topics) || log.topics.length < 2) continue;
+    const addr = (log.address || '').toLowerCase();
+    if (target && addr !== target) continue;
+    const t1 = log.topics[1];
+    if (typeof t1 === 'string' && /^0x[0-9a-fA-F]{64}$/.test(t1)) {
+      return t1.toLowerCase();
+    }
+  }
+  return null;
 }
 
 // ====== WEBHOOK HANDLER ======
@@ -80,11 +185,10 @@ app.post(
     try {
       const signature = (req.header('x-tenderly-signature') || '').trim();
       const date = (req.header('date') || '').trim();
-      const contentType = (req.header('content-type') || '').trim();
       const rawLen = Buffer.isBuffer(req.body) ? (req.body as Buffer).length : 0;
 
       req.log.info(
-        { contentType, sigPresent: Boolean(signature), datePresent: Boolean(date), rawLen },
+        { sigPresent: Boolean(signature), datePresent: Boolean(date), rawLen },
         'tenderly webhook received',
       );
 
@@ -118,21 +222,20 @@ app.post(
         req.log.info('TEST event - ignoring');
         return res.status(200).send('ok');
       }
-      if (eventType !== 'ALERT') {
+      if (eventType && eventType !== 'ALERT') {
         req.log.info({ eventType }, 'Non-ALERT event - ignored');
         return res.status(200).send('ignored');
       }
 
-      // Витягнути tx_hash + tx_input з тіла Tenderly alert.
-      // Tenderly Function Call Alert payload містить transaction object з input field.
       const tx =
         body?.transaction ?? body?.alert?.transaction ?? body?.data?.transaction ?? {};
       const txHash: string | undefined = tx?.hash || body?.alert?.tx_hash || body?.tx_hash;
       const txInput: string | undefined = tx?.input || tx?.data;
-      const txTo: string | undefined = (tx?.to || tx?.to_address || '').toLowerCase?.();
+      const txTo: string = ((tx?.to || tx?.to_address || '') as string).toLowerCase();
+      const txLogs: RawLog[] | undefined = tx?.logs || tx?.receipt?.logs;
 
       req.log.info(
-        { txHash, txTo, hasInput: Boolean(txInput) },
+        { txHash, txTo, hasInput: Boolean(txInput), logsCount: txLogs?.length ?? 0 },
         'parsed transaction fields',
       );
 
@@ -141,88 +244,177 @@ app.post(
         return res.status(200).send('ok');
       }
 
-      // Опціонально перевіряємо, що це наш pool contract (на випадок мисconfig alert у Tenderly).
-      if (POOL_CONTRACT && txTo && txTo !== POOL_CONTRACT) {
-        req.log.info(
-          { txTo, expected: POOL_CONTRACT },
-          'tx.to != POOL_CONTRACT — ignoring',
-        );
+      if (ALLOWED_CONTRACTS.length > 0 && txTo && !ALLOWED_CONTRACTS.includes(txTo)) {
+        req.log.info({ txTo, allowed: ALLOWED_CONTRACTS }, 'tx.to not in allow-list — ignoring');
         return res.status(200).send('ok');
       }
 
-      const decoded = decodeSetPoolStart(txInput, EXPECTED_SELECTOR);
-      if (!decoded) {
-        req.log.info(
-          { selectorPreview: txInput.slice(0, 10) },
-          'Input does not match setPoolStartedTimestamp — ignoring',
-        );
-        return res.status(200).send('ok');
+      const selector = txInput.slice(0, 10).toLowerCase();
+
+      // -----------------------------------------------------------------
+      // DISPATCH BY SELECTOR
+      // -----------------------------------------------------------------
+      if (selector === INITIALIZE_POOL_SELECTOR) {
+        await handleInitializePool({ req, txHash, txInput, txTo, txLogs });
+      } else if (selector === ADD_POOL_OWNERS_SELECTOR) {
+        await handleAddPoolOwners({ req, txHash, txInput });
+      } else if (selector === RESCHEDULE_SELECTOR) {
+        await handleReschedule({ req, txHash, txInput });
+      } else {
+        req.log.info({ selector }, 'Unknown selector — ignored');
       }
 
-      const { poolId, startTimestampSec } = decoded;
-      req.log.info({ poolId, startTimestampSec }, 'decoded setPoolStartedTimestamp');
-
-      // ----- стан і дедуп по txHash -----
-      const existing = getPool(poolId);
-      const alreadySeenTx = existing?.history.some((c) => c.txHash === txHash) ?? false;
-      if (alreadySeenTx) {
-        req.log.info({ poolId, txHash }, 'tx already processed for this pool — ignoring');
-        return res.status(200).send('ok');
-      }
-
-      const prevStart =
-        existing && existing.history.length > 0
-          ? existing.history[existing.history.length - 1].startTimestampSec
-          : null;
-
-      const state = upsertPoolCall(poolId, {
-        txHash,
-        sentAtMs: Date.now(),
-        startTimestampSec,
-      });
-
-      const updates = state.history.length;
-
-      // ----- TG -----
-      const html = buildMessage({
-        poolId,
-        txHash,
-        startTsSec: startTimestampSec,
-        prevStartTsSec: prevStart,
-        updates,
-      });
-
-      const chats = getChatIds();
-      for (const chatId of chats) {
-        const existingMsgId = state.messages[chatId];
-        let posted = false;
-        if (existingMsgId) {
-          posted = await editMessage(chatId, existingMsgId, html);
-        }
-        if (!posted) {
-          const newMsgId = await sendMessage(chatId, html);
-          if (newMsgId) rememberMessage(poolId, chatId, newMsgId);
-        }
-      }
-
-      req.log.info(
-        { poolId, updates, ms: Date.now() - startedAt },
-        'processed setPoolStartedTimestamp',
-      );
+      req.log.info({ selector, txHash, ms: Date.now() - startedAt }, 'processed');
       return res.status(200).send('ok');
     } catch (err: any) {
       (req as any).log?.error?.(
-        {
-          err: err?.message || err,
-          stack: err?.stack,
-          ms: Date.now() - startedAt,
-        },
+        { err: err?.message || err, stack: err?.stack, ms: Date.now() - startedAt },
         'Error handling webhook',
       );
       return res.status(500).send('error');
     }
   },
 );
+
+// ====== HANDLERS ======
+async function handleInitializePool(args: {
+  req: Request;
+  txHash: string;
+  txInput: string;
+  txTo: string;
+  txLogs: RawLog[] | undefined;
+}) {
+  const { req, txHash, txInput, txTo, txLogs } = args;
+  const decoded = decodeInitializePool(txInput);
+  if (!decoded) {
+    req.log.warn({ selector: txInput.slice(0, 10) }, 'initializePool decode failed');
+    return;
+  }
+
+  const poolId = extractPoolIdFromLogs(txLogs, txTo) || `0x${txHash.slice(2).padEnd(64, '0').slice(0, 64)}`;
+
+  if (alreadyProcessed(poolId, 'init', txHash)) {
+    req.log.info({ poolId, txHash }, 'init already processed — ignoring');
+    return;
+  }
+
+  // Витягуємо token info — best-effort. Не блокуємо повідомлення, якщо RPC не відповів вчасно.
+  let tokenInfo: TokenInfo | null = null;
+  try {
+    tokenInfo = await fetchTokenInfo(decoded.currency0);
+    req.log.info(
+      { currency0: decoded.currency0, symbol: tokenInfo.symbol, name: tokenInfo.name },
+      'fetched token info',
+    );
+  } catch (e: any) {
+    req.log.warn({ err: e?.message }, 'fetchTokenInfo failed (continuing without)');
+  }
+
+  setPoolMetadata(poolId, {
+    currency0: decoded.currency0,
+    currency1: decoded.currency1,
+    fee: decoded.fee,
+    tokenInfo,
+  });
+  recordEvent(poolId, {
+    kind: 'init',
+    txHash,
+    sentAtMs: Date.now(),
+    startTimestampSec: decoded.startTimestampSec,
+  });
+
+  const html = buildInitMessage({
+    poolId,
+    txHash,
+    startTsSec: decoded.startTimestampSec,
+    currency0: decoded.currency0,
+    currency1: decoded.currency1,
+    fee: decoded.fee,
+    tokenInfo,
+  });
+
+  for (const chatId of getChatIds()) {
+    const msgId = await sendMessage(chatId, html);
+    if (msgId) rememberInitMessage(poolId, chatId, msgId);
+  }
+}
+
+async function handleAddPoolOwners(args: {
+  req: Request;
+  txHash: string;
+  txInput: string;
+}) {
+  const { req, txHash, txInput } = args;
+  const decoded = decodeAddPoolOwners(txInput);
+  if (!decoded) {
+    req.log.warn({ selector: txInput.slice(0, 10) }, 'addPoolOwners decode failed');
+    return;
+  }
+  // MVP: лише лог, без TG-повідомлення (це службова tx, не сигнал community).
+  recordEvent(decoded.poolId, { kind: 'admin', txHash, sentAtMs: Date.now() });
+  req.log.info(
+    { poolId: decoded.poolId, owners: decoded.owners, txHash },
+    'addPoolOwners (admin configured) — logged only',
+  );
+}
+
+async function handleReschedule(args: {
+  req: Request;
+  txHash: string;
+  txInput: string;
+}) {
+  const { req, txHash, txInput } = args;
+  const decoded = decodeSetPoolStart(txInput, RESCHEDULE_SELECTOR);
+  if (!decoded) {
+    req.log.warn({ selector: txInput.slice(0, 10) }, 'setPoolStartedTimestamp decode failed');
+    return;
+  }
+  const { poolId, startTimestampSec } = decoded;
+
+  if (alreadyProcessed(poolId, 'reschedule', txHash)) {
+    req.log.info({ poolId, txHash }, 'reschedule already processed — ignoring');
+    return;
+  }
+
+  const existing = getPool(poolId);
+  const prevStart =
+    existing?.history
+      .filter((c) => c.kind === 'reschedule' || c.kind === 'init')
+      .map((c) => c.startTimestampSec)
+      .filter((t): t is number => typeof t === 'number')
+      .slice(-1)[0] ?? null;
+
+  const state = recordEvent(poolId, {
+    kind: 'reschedule',
+    txHash,
+    sentAtMs: Date.now(),
+    startTimestampSec,
+  });
+
+  const updates = state.history.filter((c) => c.kind === 'reschedule').length;
+
+  const html = buildRescheduleMessage({
+    poolId,
+    txHash,
+    startTsSec: startTimestampSec,
+    prevStartTsSec: prevStart,
+    updates,
+    tokenInfo: state.tokenInfo,
+    currency0: state.currency0,
+  });
+
+  for (const chatId of getChatIds()) {
+    const existingMsgId = state.initMessages[chatId];
+    let edited = false;
+    if (existingMsgId) {
+      // Edit оригінальний init-message, якщо ми його шепнули у тому ж рестарті
+      edited = await editMessage(chatId, existingMsgId, html);
+    }
+    if (!edited) {
+      await sendMessage(chatId, html);
+    }
+  }
+}
 
 // ====== START ======
 const port = Number(process.env.PORT || 8080);
