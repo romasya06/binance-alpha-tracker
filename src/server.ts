@@ -22,12 +22,12 @@ import {
   rememberInitMessage,
   alreadyProcessed,
 } from './state.js';
-import { formatKyiv, formatLead } from './utils/time.js';
+import { formatKyiv, formatLead, formatKyivUa, formatUtcTime, formatLeadUa } from './utils/time.js';
 
 const app = express();
 
 // ====== BOOT LOG ======
-console.log('[boot] binance-alpha-tracker version=2026-05-28-currency-side-fix');
+console.log('[boot] binance-alpha-tracker version=2026-06-11-ua-template');
 console.log('[boot] NODE_ENV=%s PORT=%s', process.env.NODE_ENV, process.env.PORT);
 console.log('[boot] POOL_CONTRACTS=%s', process.env.POOL_CONTRACTS || process.env.POOL_CONTRACT || '(any)');
 console.log('[boot] BSC_RPC_URL=%s', process.env.BSC_RPC_URL || '(default public)');
@@ -89,6 +89,15 @@ function tickerOrShort(t: TokenInfo | null, addr: string): string {
   return addr.slice(0, 6) + '…' + addr.slice(-4);
 }
 
+// Рефбек-лінк публічний (не секрет), тому дефолт зашитий у код;
+// env vars лишаються для перевизначення.
+const REFBACK_URL = process.env.REFBACK_URL || 'https://t.me/cryptohornettg/1354';
+const REFBACK_LABEL = process.env.REFBACK_LABEL || 'Refback 45%';
+
+function refbackLine(): string {
+  return `\n<a href="${escHtml(REFBACK_URL)}">${escHtml(REFBACK_LABEL)}</a>`;
+}
+
 function buildInitMessage(args: {
   poolId: string;
   txHash: string;
@@ -98,7 +107,7 @@ function buildInitMessage(args: {
   fee: number;
   tokenInfo: TokenInfo | null;
 }): string {
-  const { poolId, txHash, startTsSec, currency0, currency1, fee, tokenInfo } = args;
+  const { txHash, startTsSec, currency0, currency1, tokenInfo } = args;
 
   const { token: tokenAddr, quote: quoteAddr } = pickSides(currency0, currency1);
 
@@ -106,29 +115,21 @@ function buildInitMessage(args: {
   const quote = quoteLabel(quoteAddr);
   const name = tokenInfo?.name && tokenInfo.name !== sym ? ` (${tokenInfo.name})` : '';
 
-  const kyiv = formatKyiv(startTsSec);
-  const lead = formatLead(startTsSec);
+  const kyiv = formatKyivUa(startTsSec);
+  const utc = formatUtcTime(startTsSec);
+  const lead = formatLeadUa(startTsSec);
 
-  const shortPool = `${poolId.slice(0, 10)}…${poolId.slice(-6)}`;
   const scanUrl = `https://bscscan.com/tx/${txHash}`;
   const tokenUrl = `https://bscscan.com/token/${tokenAddr}`;
-  const feeBps = (fee / 100).toFixed(2); // 100 → 1.00 %
-
-  const refbackUrl = process.env.REFBACK_URL;
-  const refbackLabel = process.env.REFBACK_LABEL || 'Refback';
-  const refbackLine = refbackUrl
-    ? `\n\n<a href="${escHtml(refbackUrl)}">${escHtml(refbackLabel)}</a>`
-    : '';
 
   return (
-    `🚀 <b>NEW BINANCE ALPHA POOL</b>\n\n` +
-    `<b>Pair:</b> <a href="${escHtml(tokenUrl)}"><b>${escHtml(sym)}</b></a>${escHtml(name)} / ${escHtml(quote)}\n` +
-    `<b>Start:</b> ${escHtml(kyiv)} Kyiv (${escHtml(lead)})\n` +
-    `<b>Fee:</b> ${escHtml(feeBps)}%\n` +
-    `<b>Pool:</b> <code>${escHtml(shortPool)}</code>\n` +
-    `<b>Token:</b> <code>${escHtml(tokenAddr)}</code>\n\n` +
+    `🚀 <b>НОВИЙ ПУЛ BINANCE ALPHA</b>\n\n` +
+    `💎 <a href="${escHtml(tokenUrl)}"><b>${escHtml(sym)}</b></a>${escHtml(name)} / ${escHtml(quote)}\n` +
+    `🕒 <b>Старт:</b> ${escHtml(kyiv)} за Києвом (${escHtml(utc)} UTC)\n` +
+    `⏳ ${escHtml(lead)}\n` +
+    `📄 <code>${escHtml(tokenAddr)}</code>\n\n` +
     `<a href="${escHtml(scanUrl)}">View on BscScan</a>` +
-    refbackLine
+    refbackLine()
   );
 }
 
@@ -142,43 +143,36 @@ function buildRescheduleMessage(args: {
   currency0: string | null;
   currency1: string | null;
 }): string {
-  const { poolId, txHash, startTsSec, prevStartTsSec, updates, tokenInfo, currency0, currency1 } = args;
+  const { txHash, startTsSec, prevStartTsSec, tokenInfo, currency0, currency1 } = args;
   const tokenAddr = currency0 && currency1 ? pickSides(currency0, currency1).token : currency0;
 
-  const kyiv = formatKyiv(startTsSec);
-  const lead = formatLead(startTsSec);
+  const kyiv = formatKyivUa(startTsSec);
+  const utc = formatUtcTime(startTsSec);
+  const lead = formatLeadUa(startTsSec);
 
   const isUpdate = prevStartTsSec !== null && prevStartTsSec !== startTsSec;
   const title = isUpdate
-    ? `⚡ <b>BINANCE ALPHA POOL RESCHEDULED</b>`
-    : `⚡ <b>BINANCE ALPHA POOL TIME SET</b>`;
+    ? `⚡ <b>ПЕРЕНЕСЕНО СТАРТ ПУЛУ BINANCE ALPHA</b>`
+    : `⚡ <b>ВСТАНОВЛЕНО ЧАС СТАРТУ ПУЛУ BINANCE ALPHA</b>`;
 
   const startLine = isUpdate
-    ? `<b>Start:</b> <s>${escHtml(formatKyiv(prevStartTsSec!))}</s> → <b>${escHtml(kyiv)} Kyiv</b> (${escHtml(lead)})`
-    : `<b>Start:</b> ${escHtml(kyiv)} Kyiv (${escHtml(lead)})`;
+    ? `🕒 <b>Старт:</b> <s>${escHtml(formatKyivUa(prevStartTsSec!))}</s> → <b>${escHtml(kyiv)} за Києвом</b> (${escHtml(utc)} UTC)`
+    : `🕒 <b>Старт:</b> ${escHtml(kyiv)} за Києвом (${escHtml(utc)} UTC)`;
 
-  const shortPool = `${poolId.slice(0, 10)}…${poolId.slice(-6)}`;
   const scanUrl = `https://bscscan.com/tx/${txHash}`;
 
   const pairLine =
     tokenAddr && tokenInfo
-      ? `<b>Token:</b> <a href="https://bscscan.com/token/${tokenAddr}"><b>${escHtml(tickerOrShort(tokenInfo, tokenAddr))}</b></a>\n`
+      ? `💎 <a href="https://bscscan.com/token/${tokenAddr}"><b>${escHtml(tickerOrShort(tokenInfo, tokenAddr))}</b></a>\n`
       : '';
-
-  const refbackUrl = process.env.REFBACK_URL;
-  const refbackLabel = process.env.REFBACK_LABEL || 'Refback';
-  const refbackLine = refbackUrl
-    ? `\n\n<a href="${escHtml(refbackUrl)}">${escHtml(refbackLabel)}</a>`
-    : '';
 
   return (
     `${title}\n\n` +
     pairLine +
     `${startLine}\n` +
-    `<b>Pool:</b> <code>${escHtml(shortPool)}</code>\n` +
-    `<b>Updates:</b> ${updates}\n` +
-    `<a href="${escHtml(scanUrl)}">View on Scan</a>` +
-    refbackLine
+    `⏳ ${escHtml(lead)}\n\n` +
+    `<a href="${escHtml(scanUrl)}">View on BscScan</a>` +
+    refbackLine()
   );
 }
 
