@@ -21,16 +21,30 @@ export function getChatIds(): string[] {
 
 type TgResponse = { ok: boolean; result?: any; description?: string; error_code?: number };
 
+const TG_TIMEOUT_MS = 15_000;
+
 async function tgCall(method: string, body: any): Promise<TgResponse> {
   const token = requireEnv('TELEGRAM_BOT_TOKEN');
   const url = `https://api.telegram.org/bot${token}/${method}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const json = (await res.json().catch(() => ({ ok: false, description: 'non-json response' }))) as TgResponse;
-  return json;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TG_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const json = (await res.json().catch(() => ({ ok: false, description: 'non-json response' }))) as TgResponse;
+    return json;
+  } catch (e: any) {
+    if (e?.name === 'AbortError') {
+      return { ok: false, description: `tg ${method} timeout after ${TG_TIMEOUT_MS}ms` };
+    }
+    return { ok: false, description: `tg ${method} fetch error: ${e?.message || e}` };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function sendMessage(chatId: string, html: string): Promise<number | null> {

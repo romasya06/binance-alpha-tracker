@@ -27,7 +27,7 @@ import { formatKyiv, formatLead } from './utils/time.js';
 const app = express();
 
 // ====== BOOT LOG ======
-console.log('[boot] binance-alpha-tracker version=2026-05-27');
+console.log('[boot] binance-alpha-tracker version=2026-05-28-currency-side-fix');
 console.log('[boot] NODE_ENV=%s PORT=%s', process.env.NODE_ENV, process.env.PORT);
 console.log('[boot] POOL_CONTRACTS=%s', process.env.POOL_CONTRACTS || process.env.POOL_CONTRACT || '(any)');
 console.log('[boot] BSC_RPC_URL=%s', process.env.BSC_RPC_URL || '(default public)');
@@ -42,23 +42,51 @@ app.use(pinoHttp());
 app.get('/health', (_req: Request, res: Response) => res.status(200).send('ok'));
 app.get('/webhooks/tenderly', (_req, res) => res.status(200).send('ok - use POST here'));
 
-const RESCHEDULE_SELECTOR = (process.env.FUNCTION_SELECTOR || '0x70e2af29').toLowerCase();
+// Дві версії — стара (CLAlphaHook v1, 0xb0ba…4d0f) і нова (CLAlphaHook v2, 0xb0bb…46af)
+// мають різні імена функцій з ідентичним layout-ом параметрів:
+//   v1:  setPoolStartedTimestamp(bytes32,uint256) → 0x70e2af29
+//   v2:  setPoolStartTime(bytes32,uint256)        → 0xf4d50b3b
+const RESCHEDULE_SELECTORS = new Set<string>([
+  (process.env.FUNCTION_SELECTOR || '0x70e2af29').toLowerCase(),
+  '0xf4d50b3b',
+]);
 const ALLOWED_CONTRACTS = (process.env.POOL_CONTRACTS || process.env.POOL_CONTRACT || '')
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// USDT BSC — використовується для розпізнавання quote-токена в pair-рядку
+// Quote-токени Binance Alpha. У Uniswap-v4 currency0 < currency1 за адресою,
+// тому "новий" токен може опинитися як currency0, так і currency1 — залежно
+// від того, як його адреса співставляється з USDT.
 const USDT_BSC = '0x55d398326f99059ff775485246999027b3197955';
+const USDC_BSC = '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d';
+const QUOTE_TOKENS: Record<string, string> = {
+  [USDT_BSC]: 'USDT',
+  [USDC_BSC]: 'USDC',
+};
+
+function isQuote(addr: string): boolean {
+  return addr.toLowerCase() in QUOTE_TOKENS;
+}
+function quoteLabel(addr: string): string {
+  return QUOTE_TOKENS[addr.toLowerCase()] ?? (addr.slice(0, 6) + '…' + addr.slice(-4));
+}
+
+/**
+ * З двох currency визначає реальний токен і котирувальну сторону.
+ * Якщо одна з currency — USDT/USDC → беремо ту, що не є quote.
+ * Якщо обидві невідомі → currency0 default (як було).
+ */
+function pickSides(currency0: string, currency1: string): { token: string; quote: string } {
+  if (isQuote(currency0) && !isQuote(currency1)) return { token: currency1, quote: currency0 };
+  if (isQuote(currency1) && !isQuote(currency0)) return { token: currency0, quote: currency1 };
+  return { token: currency0, quote: currency1 };
+}
 
 // ====== MESSAGE BUILDERS ======
 function tickerOrShort(t: TokenInfo | null, addr: string): string {
   if (t?.symbol && t.symbol.length <= 12) return t.symbol;
   return addr.slice(0, 6) + '…' + addr.slice(-4);
-}
-
-function quoteName(currency1: string): string {
-  return currency1.toLowerCase() === USDT_BSC ? 'USDT' : tickerOrShort(null, currency1);
 }
 
 function buildInitMessage(args: {
@@ -72,8 +100,10 @@ function buildInitMessage(args: {
 }): string {
   const { poolId, txHash, startTsSec, currency0, currency1, fee, tokenInfo } = args;
 
-  const sym = tickerOrShort(tokenInfo, currency0);
-  const quote = quoteName(currency1);
+  const { token: tokenAddr, quote: quoteAddr } = pickSides(currency0, currency1);
+
+  const sym = tickerOrShort(tokenInfo, tokenAddr);
+  const quote = quoteLabel(quoteAddr);
   const name = tokenInfo?.name && tokenInfo.name !== sym ? ` (${tokenInfo.name})` : '';
 
   const kyiv = formatKyiv(startTsSec);
@@ -81,7 +111,7 @@ function buildInitMessage(args: {
 
   const shortPool = `${poolId.slice(0, 10)}…${poolId.slice(-6)}`;
   const scanUrl = `https://bscscan.com/tx/${txHash}`;
-  const tokenUrl = `https://bscscan.com/token/${currency0}`;
+  const tokenUrl = `https://bscscan.com/token/${tokenAddr}`;
   const feeBps = (fee / 100).toFixed(2); // 100 → 1.00 %
 
   const refbackUrl = process.env.REFBACK_URL;
@@ -96,7 +126,7 @@ function buildInitMessage(args: {
     `<b>Start:</b> ${escHtml(kyiv)} Kyiv (${escHtml(lead)})\n` +
     `<b>Fee:</b> ${escHtml(feeBps)}%\n` +
     `<b>Pool:</b> <code>${escHtml(shortPool)}</code>\n` +
-    `<b>Token:</b> <code>${escHtml(currency0)}</code>\n\n` +
+    `<b>Token:</b> <code>${escHtml(tokenAddr)}</code>\n\n` +
     `<a href="${escHtml(scanUrl)}">View on BscScan</a>` +
     refbackLine
   );
@@ -110,8 +140,10 @@ function buildRescheduleMessage(args: {
   updates: number;
   tokenInfo: TokenInfo | null;
   currency0: string | null;
+  currency1: string | null;
 }): string {
-  const { poolId, txHash, startTsSec, prevStartTsSec, updates, tokenInfo, currency0 } = args;
+  const { poolId, txHash, startTsSec, prevStartTsSec, updates, tokenInfo, currency0, currency1 } = args;
+  const tokenAddr = currency0 && currency1 ? pickSides(currency0, currency1).token : currency0;
 
   const kyiv = formatKyiv(startTsSec);
   const lead = formatLead(startTsSec);
@@ -129,8 +161,8 @@ function buildRescheduleMessage(args: {
   const scanUrl = `https://bscscan.com/tx/${txHash}`;
 
   const pairLine =
-    currency0 && tokenInfo
-      ? `<b>Token:</b> <a href="https://bscscan.com/token/${currency0}"><b>${escHtml(tickerOrShort(tokenInfo, currency0))}</b></a>\n`
+    tokenAddr && tokenInfo
+      ? `<b>Token:</b> <a href="https://bscscan.com/token/${tokenAddr}"><b>${escHtml(tickerOrShort(tokenInfo, tokenAddr))}</b></a>\n`
       : '';
 
   const refbackUrl = process.env.REFBACK_URL;
@@ -258,8 +290,8 @@ app.post(
         await handleInitializePool({ req, txHash, txInput, txTo, txLogs });
       } else if (selector === ADD_POOL_OWNERS_SELECTOR) {
         await handleAddPoolOwners({ req, txHash, txInput });
-      } else if (selector === RESCHEDULE_SELECTOR) {
-        await handleReschedule({ req, txHash, txInput });
+      } else if (RESCHEDULE_SELECTORS.has(selector)) {
+        await handleReschedule({ req, txHash, txInput, selector });
       } else {
         req.log.info({ selector }, 'Unknown selector — ignored');
       }
@@ -298,12 +330,21 @@ async function handleInitializePool(args: {
     return;
   }
 
+  // Визначаємо реальний токен: якщо currency0=USDT/USDC, "новий" токен — це currency1.
+  const { token: realTokenAddr } = pickSides(decoded.currency0, decoded.currency1);
+
   // Витягуємо token info — best-effort. Не блокуємо повідомлення, якщо RPC не відповів вчасно.
   let tokenInfo: TokenInfo | null = null;
   try {
-    tokenInfo = await fetchTokenInfo(decoded.currency0);
+    tokenInfo = await fetchTokenInfo(realTokenAddr);
     req.log.info(
-      { currency0: decoded.currency0, symbol: tokenInfo.symbol, name: tokenInfo.name },
+      {
+        currency0: decoded.currency0,
+        currency1: decoded.currency1,
+        realToken: realTokenAddr,
+        symbol: tokenInfo.symbol,
+        name: tokenInfo.name,
+      },
       'fetched token info',
     );
   } catch (e: any) {
@@ -362,9 +403,10 @@ async function handleReschedule(args: {
   req: Request;
   txHash: string;
   txInput: string;
+  selector: string;
 }) {
-  const { req, txHash, txInput } = args;
-  const decoded = decodeSetPoolStart(txInput, RESCHEDULE_SELECTOR);
+  const { req, txHash, txInput, selector } = args;
+  const decoded = decodeSetPoolStart(txInput, selector);
   if (!decoded) {
     req.log.warn({ selector: txInput.slice(0, 10) }, 'setPoolStartedTimestamp decode failed');
     return;
@@ -401,6 +443,7 @@ async function handleReschedule(args: {
     updates,
     tokenInfo: state.tokenInfo,
     currency0: state.currency0,
+    currency1: state.currency1,
   });
 
   for (const chatId of getChatIds()) {
